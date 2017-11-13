@@ -28,7 +28,7 @@ import akka.http.scaladsl.model.headers.{ ModeledCustomHeader, ModeledCustomHead
 import akka.http.scaladsl.model.{ HttpEntity, HttpRequest, HttpResponse, RequestEntity, ResponseEntity, StatusCode, Uri }
 import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.{ Sink, Source }
+import akka.stream.scaladsl.{ Flow, Sink, Source }
 import io.circe.Json
 import io.circe.parser.parse
 import de.heikoseeberger.constructr.coordination.Coordination
@@ -111,11 +111,9 @@ final class ConsulCoordination(
 
   private val nodesUri = baseUri.withPath(baseUri.path / "nodes")
 
-  private val outgoingConnection =
-    if (settings.https)
-      Http(system).outgoingConnectionHttps(settings.host, settings.port)
-    else
-      Http(system).outgoingConnection(settings.host, settings.port)
+  implicit private val outgoingConnection
+    : Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] =
+    createOutgoingConnection(system)
 
   def getNodes(): Future[Set[Address]] = {
     def unmarshalNodes(entity: ResponseEntity): Future[Set[Address]] = {
@@ -212,29 +210,36 @@ final class ConsulCoordination(
     }
   }
 
-  def refresh(self: Address, ttl: FiniteDuration): Future[Done] = {
-    val sessionId = stateSession.getOrElse(
-      throw new IllegalStateException(
-        "It wasn't possible to get a valid Consul `sessionId` for refreshing"
-      )
-    )
-    val uri = sessionUri.withPath(sessionUri.path / "renew" / sessionId)
-    send(Put(uri)).flatMap {
-      case HttpResponse(OK, _, entity, _) => ignore(entity).map(_ => Done)
-      case HttpResponse(NotFound, _, entity, _) =>
-        ignore(entity)
-          .flatMap { _ =>
-            logger.warning(
-              "Unable to refresh, session {} not found. Creating a new one",
-              sessionId
-            )
-            createIfNotExist(self, ttl)
-          }
-          .map(_ => Done)
-      case HttpResponse(other, _, entity, _) =>
-        ignore(entity).map(_ => throw UnexpectedStatusCode(uri, other))
+  def refresh(self: Address, ttl: FiniteDuration): Future[Done] =
+    Future.fromTry(getSessionId).flatMap { sessionId =>
+      val uri = sessionUri.withPath(sessionUri.path / "renew" / sessionId)
+      send(Put(uri)).flatMap {
+        case HttpResponse(OK, _, entity, _) => ignore(entity).map(_ => Done)
+        case HttpResponse(NotFound, _, entity, _) =>
+          ignore(entity)
+            .flatMap { _ =>
+              logger.warning(
+                "Unable to refresh, session {} not found. Creating a new one",
+                sessionId
+              )
+              createIfNotExist(self, ttl)
+            }
+            .map(_ => Done)
+        case HttpResponse(other, _, entity, _) =>
+          ignore(entity).map(_ => throw UnexpectedStatusCode(uri, other))
+      }
     }
-  }
+
+  def close(): Future[Done] =
+    Future.fromTry(getSessionId).flatMap(destroySession)
+
+  private def getSessionId: Try[SessionId] =
+    Try(
+      stateSession.getOrElse(
+        throw new IllegalStateException(
+          "It wasn't possible to get a valid Consul `sessionId` for refreshing"
+        ))
+    )
 
   private def putKeyWithSession(
       keyUri: Uri,
@@ -310,12 +315,66 @@ final class ConsulCoordination(
     }
   }
 
+  private def destroySession(sessionId: SessionId): Future[Done] = {
+    // Create new ActorSystem so that we can use akka-http to destroy the Consul session.
+    // That's because the original ActorSystem is terminating, so it is useless for akka-http
+    // purposes (would throw a java.lang.IllegalStateException: cannot create children while
+    // terminating or terminated)
+    import com.typesafe.config.ConfigFactory
+    val cleanupSystem: ActorSystem =
+      ActorSystem("constructr-cleanup", ConfigFactory.defaultReference())
+    implicit val mat: ActorMaterializer = ActorMaterializer()(cleanupSystem)
+    val uri: Uri                        = sessionUri.withPath(sessionUri.path / "destroy" / sessionId)
+
+    implicit val outgoingConnection
+      : Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] =
+      createOutgoingConnection(cleanupSystem)
+    val logger = cleanupSystem.log
+
+    send(Put(uri))
+      .flatMap {
+        case HttpResponse(OK, _, entity, _) =>
+          Unmarshal(entity)
+            .to[String]
+            .map { destroyed =>
+              if (destroyed == "true") {
+                logger.info("Consul session successfully destroyed")
+              } else {
+                logger.warning("Consul session could not be destroyed: " +
+                  "session might not exist or be already expired")
+              }
+              Done
+            }
+        case HttpResponse(_, _, entity, _) =>
+          Unmarshal(entity).to[String].map { response =>
+            val msg =
+              s"Consul session could not be destroyed because something went wrong: $response"
+            logger.error(msg)
+            throw new RuntimeException(msg)
+          }
+      }
+      .andThen {
+        case _ =>
+          mat.shutdown()
+          cleanupSystem.terminate()
+      }
+  }
+
+  private def createOutgoingConnection(
+      system: ActorSystem): Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]] =
+    if (settings.https)
+      Http(system).outgoingConnectionHttps(settings.host, settings.port)
+    else
+      Http(system).outgoingConnection(settings.host, settings.port)
+
   private def parseJson[T](s: String, f: Json => T) = {
     import cats.syntax.either._ // for Scala 2.11
     parse(s).fold(throw _, identity).as[Set[Json]].getOrElse(Set.empty).map(f)
   }
 
-  private def send(baseRequest: HttpRequest) = {
+  private def send(baseRequest: HttpRequest)(
+      implicit mat: ActorMaterializer,
+      oc: Flow[HttpRequest, HttpResponse, Future[Http.OutgoingConnection]]) = {
     def request: HttpRequest =
       settings.accessToken.map { token =>
         val newHeaders = baseRequest.headers :+ ConsulToken(token)
@@ -325,7 +384,7 @@ final class ConsulCoordination(
     Source
       .single(request)
       .log("constructr-coordination-consul-requests")
-      .via(outgoingConnection)
+      .via(oc)
       .log("constructr-coordination-consul-responses")
       .runWith(Sink.head)
   }

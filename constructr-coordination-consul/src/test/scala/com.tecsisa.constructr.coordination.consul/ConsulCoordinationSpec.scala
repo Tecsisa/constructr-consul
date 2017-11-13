@@ -18,9 +18,10 @@ package com.tecsisa.constructr.coordination.consul
 
 import akka.Done
 import akka.actor.{ ActorSystem, AddressFromURIString }
-import akka.testkit.{ TestDuration, TestProbe }
+import akka.testkit.TestDuration
 import com.typesafe.config.ConfigFactory
 import org.scalatest.{ BeforeAndAfterAll, Matchers, WordSpec }
+
 import scala.concurrent.duration.{ Duration, DurationInt, FiniteDuration }
 import scala.concurrent.{ Await, Awaitable }
 import scala.util.Random
@@ -70,12 +71,9 @@ class ConsulCoordinationSpec extends WordSpec with Matchers with BeforeAndAfterA
       resultOf(coordination.refresh(address1, 10.seconds)) shouldBe Done
       resultOf(coordination.getNodes()) shouldBe Set(address1)
 
-      val probe = TestProbe()
-      import probe._
-      awaitAssert(
-        resultOf(coordination.getNodes()) shouldBe 'empty,
-        25.seconds // Wait until open sessions expire
-      )
+      // Close
+      resultOf(coordination.close()) shouldBe Done
+      resultOf(coordination.getNodes()) shouldBe 'empty
     }
   }
 
